@@ -18,8 +18,8 @@ Target use: describing the scene in front of the camera for someone who cannot s
 |--------------|------|
 | `app.py`     | Flask app: camera init, capture loop, routes (`/`, `/video_feed`, `/capture`, `/speak`), inline HTML/JS/CSS. |
 | `tts.py`     | Piper TTS: `TTSEngine` singleton, `get_tts()`. Voice path from `PIPER_MODEL` or default `voices/en_US-lessac-medium`. |
-| `vlm.py`     | VLM: `VLMEngine` interface; `HailoQwen2VL` (Hailo-10H, placeholder); `BLIPCaptioner` (CPU fallback via Hugging Face). `get_vlm_engine()` returns the active engine. |
-| `requirements.txt` | Flask, Pillow, piper-tts, numpy, opencv; optional: transformers, torch, accelerate for BLIP. System: rpicam-apps (rpicam-vid, rpicam-still). |
+| `vlm.py`     | VLM: `VLMEngine` interface; `HailoQwen2VL` (Hailo-10H). `get_vlm_engine()` returns the Hailo engine. |
+| `requirements.txt` | Flask, Pillow, piper-tts, numpy, opencv. System: rpicam-apps (rpicam-vid, rpicam-still). |
 
 ## Conventions and patterns
 
@@ -38,12 +38,12 @@ Target use: describing the scene in front of the camera for someone who cannot s
 
 - **app.py**: Preserve threading (MJPEG reader loop, locks around `_last_jpeg`). Adding routes or changing HTML is fine; keep lazy TTS/VLM loading.
 - **tts.py**: Piper expects `.onnx` (and `.onnx.json`) at `model_path`; `_ensure_loaded()` handles missing file by returning False.
-- **vlm.py**: `describe_image()` accepts PIL `Image` or numpy array (RGB). BLIP uses `Salesforce/blip-image-captioning-base`. Hailo integration is stubbed; keep the same `VLMEngine` interface when implementing.
+- **vlm.py**: `describe_image()` accepts PIL `Image` or numpy array (RGB). Hailo integration is stubbed; keep the same `VLMEngine` interface when implementing.
 
 ## Testing and dependencies
 
 - Install: `pip install -r requirements.txt`.
 - Pi: ensure rpicam-apps is installed (rpicam-vid, rpicam-still; same stack as rpicam-hello); optionally add Piper voice files under `voices/` or set `PIPER_MODEL`.
-- Without GPU, BLIP runs on CPU (slower); Hailo path is not yet wired.
+- Hailo path is not yet wired; placeholder returns integration-pending message.
 
 Use this file to stay consistent with project structure, conventions, and intent when suggesting or making changes.

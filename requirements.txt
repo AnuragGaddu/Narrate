@@ -4,8 +4,8 @@ pillow>=10.0.0
 piper-tts>=1.2.0
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
-
 # Optional: CPU fallback VLM (lightweight image captioning)
 transformers>=4.40.0
 torch>=2.0.0
 accelerate>=0.25.0
+
