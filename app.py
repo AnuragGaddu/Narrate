@@ -24,6 +24,11 @@ _camera_ready = False
 _last_jpeg = None
 _last_jpeg_lock = threading.Lock()
 
+# When set, video_feed serves this frame instead of live stream for 3 seconds
+_frozen_jpeg = None
+_frozen_until = 0.0
+_freeze_lock = threading.Lock()
+
 # JPEG markers for MJPEG frame splitting
 _JPEG_SOI = b"\xff\xd8"
 _JPEG_EOI = b"\xff\xd9"
@@ -123,11 +128,21 @@ def _mjpeg_reader_loop():
 
 
 def video_feed():
-    """MJPEG stream endpoint."""
+    """MJPEG stream endpoint. Serves frozen captured frame for 3s after capture, else live stream."""
     def gen():
+        global _frozen_jpeg
         while _camera_ready:
-            with _last_jpeg_lock:
-                frame = _last_jpeg
+            with _freeze_lock:
+                now = time.time()
+                if _frozen_jpeg is not None and now >= _frozen_until:
+                    _frozen_jpeg = None  # expire freeze
+                if _frozen_jpeg is not None:
+                    frame = _frozen_jpeg
+                else:
+                    frame = None
+            if frame is None:
+                with _last_jpeg_lock:
+                    frame = _last_jpeg
             if frame:
                 yield (b"--FRAME\r\n"
                        b"Content-Type: image/jpeg\r\n"
@@ -365,10 +380,24 @@ def video_feed_route():
 
 @app.route("/capture", methods=["POST"])
 def capture_route():
-    """Capture frame, run VLM, optionally generate TTS."""
+    """Capture frame, run VLM, optionally generate TTS. Freezes stream to this frame for 3s."""
+    global _frozen_jpeg, _frozen_until
     frame = capture_frame()
     if frame is None:
         return jsonify({"error": "Camera not available"}), 500
+
+    # Show captured frame on the stream area for 3 seconds
+    try:
+        from PIL import Image
+        import io
+        img = Image.fromarray(frame)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        with _freeze_lock:
+            _frozen_jpeg = buf.getvalue()
+            _frozen_until = time.time() + 3.0
+    except Exception as e:
+        logger.debug("Could not freeze frame for display: %s", e)
 
     try:
         vlm = get_vlm()
