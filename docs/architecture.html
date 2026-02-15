@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Narrate - System Architecture</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 40px 20px;
+            line-height: 1.6;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 8px;
+            color: #f8fafc;
+        }
+        .subtitle {
+            color: #94a3b8;
+            font-size: 1rem;
+            margin-bottom: 40px;
+        }
+        h2 {
+            font-size: 1.4rem;
+            color: #f8fafc;
+            margin: 48px 0 20px 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #1e293b;
+        }
+        h3 {
+            font-size: 1.1rem;
+            color: #cbd5e1;
+            margin: 32px 0 16px 0;
+        }
+
+        .diagram-card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 32px;
+            margin-bottom: 24px;
+            overflow-x: auto;
+        }
+        .diagram-card .mermaid {
+            display: flex;
+            justify-content: center;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+            font-size: 0.9rem;
+        }
+        th {
+            background: #1e293b;
+            color: #94a3b8;
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 2px solid #334155;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #1e293b;
+            color: #cbd5e1;
+        }
+        tr:hover td { background: #1e293b; }
+        td strong { color: #f8fafc; }
+        code {
+            background: #334155;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            color: #7dd3fc;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Narrate - System Architecture</h1>
+        <p class="subtitle">Raspberry Pi + Hailo-10H AI Accelerator | Vision-Language Model + Text-to-Speech</p>
+
+        <!-- ============================================================ -->
+        <h2>Architecture Diagram</h2>
+        <div class="diagram-card">
+            <div class="mermaid">
+graph TB
+    subgraph Browser["Browser - Client"]
+        UI["Flask HTML/JS UI"]
+        Tab1["Tab 1: Narration Camera"]
+        Tab2["Tab 2: Text to Speech"]
+        UI --> Tab1
+        UI --> Tab2
+    end
+
+    subgraph Flask["Flask Application - app.py"]
+        IndexRoute["GET /"]
+        VideoRoute["GET /video_feed"]
+        CaptureRoute["POST /capture"]
+        SpeakRoute["POST /speak"]
+        TTSPlayRoute["POST /tts_play"]
+    end
+
+    subgraph Camera["Pi Camera Module"]
+        rpicam_vid["rpicam-vid subprocess\nMJPEG stream 640x480"]
+        ReaderThread["_mjpeg_reader_loop\nbackground thread"]
+        FrameBuffer["_last_jpeg\nlatest JPEG frame"]
+        FreezeLogic["Freeze Logic\n_frozen_jpeg 3s hold"]
+        rpicam_still["rpicam-still\nfallback single capture"]
+        rpicam_vid -->|stdout pipe| ReaderThread
+        ReaderThread -->|extracts frames| FrameBuffer
+    end
+
+    subgraph HailoAccelerator["Hailo-10H AI Accelerator"]
+        VDevice["hailo_platform.VDevice"]
+        VLMAPI["hailo_platform.genai.VLM"]
+        HEF["Qwen2-VL-2B-Instruct.hef\nin models dir"]
+        VDevice --> VLMAPI
+        HEF -->|loaded into| VLMAPI
+    end
+
+    subgraph VLMModule["VLM Engine - vlm.py"]
+        VLMEngine["HailoQwen2VL class"]
+        Preprocess["Image Preprocessing\nresize, dtype cast via OpenCV"]
+        Prompt["Prompt Builder\nstructured Qwen2 chat format"]
+        VLMEngine --> Preprocess
+        Preprocess --> Prompt
+        Prompt -->|generate_all| VLMAPI
+    end
+
+    subgraph TTSModule["TTS Engine - tts.py"]
+        TTSEngine["TTSEngine class"]
+        PiperVoice["Piper TTS Library\npiper-tts"]
+        VoiceModel["en_US-lessac-medium.onnx\nin voices dir"]
+        TTSEngine --> PiperVoice
+        VoiceModel -->|loaded by| PiperVoice
+        PiperVoice -->|synthesize_wav| WAVFile["WAV File\ntemp file"]
+    end
+
+    subgraph AudioOut["Audio Output"]
+        Aplay["aplay\nALSA subprocess"]
+        Speaker["USB Speaker\nEMEET M0 Plus\nplughw:2,0"]
+        Aplay --> Speaker
+    end
+
+    Tab1 -->|view stream| VideoRoute
+    Tab1 -->|click Capture| CaptureRoute
+    Tab1 -->|click Speak| SpeakRoute
+    Tab2 -->|click Speak| TTSPlayRoute
+    IndexRoute -->|serves HTML/JS| UI
+
+    VideoRoute -->|reads frame| FrameBuffer
+    VideoRoute -->|or frozen| FreezeLogic
+    FreezeLogic -.->|3s after capture| FrameBuffer
+
+    CaptureRoute -->|capture_frame| FrameBuffer
+    CaptureRoute -.->|fallback| rpicam_still
+    CaptureRoute -->|numpy array| VLMEngine
+    VLMAPI -->|text description| CaptureRoute
+    CaptureRoute -->|narration text| TTSEngine
+    CaptureRoute -->|freeze frame| FreezeLogic
+
+    SpeakRoute -->|text| TTSEngine
+    TTSPlayRoute -->|text| TTSEngine
+
+    WAVFile -->|wav path| Aplay
+
+    classDef hardware fill:#4a5568,stroke:#a0aec0,color:#fff
+    classDef flask fill:#1a365d,stroke:#63b3ed,color:#fff
+    classDef ai fill:#553c9a,stroke:#b794f4,color:#fff
+    classDef tts fill:#285e61,stroke:#81e6d9,color:#fff
+    classDef audio fill:#744210,stroke:#fbd38d,color:#fff
+    classDef browser fill:#2d3748,stroke:#a0aec0,color:#fff
+
+    class rpicam_vid,ReaderThread,FrameBuffer,FreezeLogic,rpicam_still hardware
+    class IndexRoute,VideoRoute,CaptureRoute,SpeakRoute,TTSPlayRoute flask
+    class VDevice,VLMAPI,HEF,VLMEngine,Preprocess,Prompt ai
+    class TTSEngine,PiperVoice,VoiceModel,WAVFile tts
+    class Aplay,Speaker audio
+    class UI,Tab1,Tab2 browser
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Data Flow Sequences</h2>
+
+        <h3>1. Live Camera Stream</h3>
+        <div class="diagram-card">
+            <div class="mermaid">
+sequenceDiagram
+    participant B as Browser
+    participant F as Flask
+    participant R as rpicam-vid
+    participant T as ReaderThread
+
+    R->>T: stdout MJPEG byte stream
+    T->>T: Split JPEG frames via SOI/EOI markers
+    T->>F: Store latest frame in _last_jpeg
+    B->>F: GET /video_feed
+    loop Every 50ms
+        F->>B: MJPEG multipart frame
+    end
+            </div>
+        </div>
+
+        <h3>2. Capture + Narrate + Speak</h3>
+        <div class="diagram-card">
+            <div class="mermaid">
+sequenceDiagram
+    participant B as Browser
+    participant F as Flask
+    participant Cam as PiCamera
+    participant V as VLM
+    participant H as Hailo10H
+    participant TTS as PiperTTS
+    participant Spk as USBSpeaker
+
+    B->>F: POST /capture
+    F->>Cam: capture_frame - read _last_jpeg
+    Cam-->>F: JPEG to numpy RGB array
+    F->>F: Freeze frame for 3s on video feed
+    F->>V: describe_image with numpy_array
+    V->>V: Resize and dtype cast via OpenCV
+    V->>H: VLM.generate_all with prompt and frames
+    H-->>V: Text description
+    V-->>F: Narration text
+    F->>TTS: synthesize_to_file with text and wav_path
+    TTS->>TTS: PiperVoice.synthesize_wav
+    TTS-->>F: WAV file on disk
+    F->>Spk: aplay -D plughw 2,0 wav_path
+    Spk-->>F: playback complete
+    F-->>B: JSON with text and speaker ok
+            </div>
+        </div>
+
+        <h3>3. Text-to-Speech - Manual Input</h3>
+        <div class="diagram-card">
+            <div class="mermaid">
+sequenceDiagram
+    participant B as Browser
+    participant F as Flask
+    participant TTS as PiperTTS
+    participant P as PiperONNX
+    participant Spk as USBSpeaker
+
+    B->>F: POST /tts_play with text
+    F->>TTS: synthesize_to_file with text and wav_path
+    TTS->>P: PiperVoice.synthesize_wav
+    P->>P: Load en_US-lessac-medium.onnx
+    P-->>TTS: Write WAV to temp file
+    TTS-->>F: success
+    F->>Spk: aplay -D plughw 2,0 wav_path
+    Spk-->>F: playback complete
+    F-->>B: JSON status ok
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>File Map</h2>
+        <div class="diagram-card">
+            <div class="mermaid">
+graph LR
+    subgraph Project["Narrate Project"]
+        app["app.py\nFlask app + routes + camera"]
+        vlm["vlm.py\nHailo VLM wrapper"]
+        tts["tts.py\nPiper TTS wrapper"]
+        req["requirements.txt"]
+
+        subgraph models["models dir"]
+            hef["Qwen2-VL-2B-Instruct.hef"]
+        end
+
+        subgraph voices["voices dir"]
+            onnx["en_US-lessac-medium.onnx"]
+            ojson["en_US-lessac-medium.onnx.json"]
+        end
+
+        subgraph static["static/audio dir"]
+            wavs["generated WAV files"]
+        end
+    end
+
+    app -->|imports| vlm
+    app -->|imports| tts
+    vlm -->|loads| hef
+    tts -->|loads| onnx
+    tts -->|reads config| ojson
+
+    classDef py fill:#306998,stroke:#FFD43B,color:#fff
+    classDef model fill:#553c9a,stroke:#b794f4,color:#fff
+    classDef config fill:#2d3748,stroke:#a0aec0,color:#fff
+
+    class app,vlm,tts py
+    class hef,onnx model
+    class ojson,req config
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Component Summary</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Component</th>
+                    <th>File / Location</th>
+                    <th>Technology</th>
+                    <th>Purpose</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Web Server</strong></td>
+                    <td><code>app.py</code></td>
+                    <td>Flask 3.x</td>
+                    <td>Routes, HTML UI, orchestration</td>
+                </tr>
+                <tr>
+                    <td><strong>Camera</strong></td>
+                    <td><code>app.py</code> (subprocess)</td>
+                    <td><code>rpicam-vid</code> / <code>rpicam-still</code></td>
+                    <td>MJPEG live stream + frame capture</td>
+                </tr>
+                <tr>
+                    <td><strong>VLM</strong></td>
+                    <td><code>vlm.py</code></td>
+                    <td>Hailo GenAI SDK</td>
+                    <td>Image to text description</td>
+                </tr>
+                <tr>
+                    <td><strong>HEF Model</strong></td>
+                    <td><code>models/Qwen2-VL-2B-Instruct.hef</code></td>
+                    <td>Hailo Execution Format</td>
+                    <td>Compiled Qwen2-VL-2B for Hailo-10H</td>
+                </tr>
+                <tr>
+                    <td><strong>TTS</strong></td>
+                    <td><code>tts.py</code></td>
+                    <td>Piper TTS (ONNX runtime)</td>
+                    <td>Text to WAV speech synthesis</td>
+                </tr>
+                <tr>
+                    <td><strong>Voice Model</strong></td>
+                    <td><code>voices/en_US-lessac-medium.onnx</code></td>
+                    <td>ONNX</td>
+                    <td>Piper voice model - English</td>
+                </tr>
+                <tr>
+                    <td><strong>Audio Playback</strong></td>
+                    <td><code>app.py</code> via <code>aplay</code></td>
+                    <td>ALSA</td>
+                    <td>WAV to USB speaker output</td>
+                </tr>
+                <tr>
+                    <td><strong>Speaker</strong></td>
+                    <td>Hardware</td>
+                    <td>EMEET OfficeCore M0 Plus</td>
+                    <td>USB audio output at plughw:2,0</td>
+                </tr>
+                <tr>
+                    <td><strong>AI Accelerator</strong></td>
+                    <td>Hardware</td>
+                    <td>Hailo-10H</td>
+                    <td>Neural network inference for VLM</td>
+                </tr>
+                <tr>
+                    <td><strong>SBC</strong></td>
+                    <td>Hardware</td>
+                    <td>Raspberry Pi 5</td>
+                    <td>Hosts entire application</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                darkMode: true,
+                background: '#1e293b',
+                primaryColor: '#334155',
+                primaryTextColor: '#e2e8f0',
+                primaryBorderColor: '#475569',
+                lineColor: '#64748b',
+                secondaryColor: '#1e293b',
+                tertiaryColor: '#0f172a'
+            },
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            },
+            sequence: {
+                useMaxWidth: true,
+                mirrorActors: false
+            }
+        });
+    </script>
+</body>
+</html>
