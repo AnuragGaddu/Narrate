@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import uuid
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -302,7 +301,9 @@ HTML = """
         .narration-box p { margin: 0; line-height: 1.5; }
         .loading { color: #94a3b8; }
         .error { color: #f87171; }
-        audio { margin-top: 12px; width: 100%; max-width: 400px; }
+        .speaker-status { font-size: 14px; color: #94a3b8; margin-top: 8px; }
+        .speaker-status.success { color: #4ade80; }
+        .speaker-status.error { color: #f87171; }
 
         /* Tab 2 - Text to Speech */
         .tts-container { max-width: 640px; }
@@ -338,7 +339,7 @@ HTML = """
         <div class="narration-box">
             <p id="narration">Press Capture to describe what the camera sees.</p>
         </div>
-        <audio id="audio" controls style="display:none"></audio>
+        <p id="speaker-status" class="speaker-status"></p>
     </div>
 
     <!-- Tab 2: Text to Speech -->
@@ -367,12 +368,14 @@ HTML = """
         const captureBtn = document.getElementById('capture');
         const speakBtn = document.getElementById('speak');
         const narrationEl = document.getElementById('narration');
-        const audioEl = document.getElementById('audio');
+        const speakerStatus = document.getElementById('speaker-status');
 
         captureBtn.addEventListener('click', async () => {
             captureBtn.disabled = true;
+            speakBtn.disabled = true;
             narrationEl.textContent = 'Processing...';
             narrationEl.className = 'loading';
+            speakerStatus.textContent = '';
             try {
                 const res = await fetch('/capture', { method: 'POST' });
                 const data = await res.json();
@@ -381,10 +384,12 @@ HTML = """
                     narrationEl.className = '';
                     speakBtn.disabled = false;
                     window._lastNarration = data.text;
-                    if (data.audio_url) {
-                        audioEl.src = data.audio_url;
-                        audioEl.style.display = 'block';
-                        audioEl.play();
+                    if (data.speaker === 'ok') {
+                        speakerStatus.textContent = 'Played on speaker.';
+                        speakerStatus.className = 'speaker-status success';
+                    } else if (data.speaker && data.speaker !== 'not_attempted') {
+                        speakerStatus.textContent = 'Speaker error: ' + data.speaker;
+                        speakerStatus.className = 'speaker-status error';
                     }
                 } else {
                     narrationEl.textContent = data.error || 'Failed to get description';
@@ -401,6 +406,8 @@ HTML = """
             const text = window._lastNarration;
             if (!text) return;
             speakBtn.disabled = true;
+            speakerStatus.textContent = 'Playing on speaker...';
+            speakerStatus.className = 'speaker-status';
             try {
                 const res = await fetch('/speak', {
                     method: 'POST',
@@ -408,13 +415,16 @@ HTML = """
                     body: JSON.stringify({ text })
                 });
                 const data = await res.json();
-                if (data.audio_url) {
-                    audioEl.src = data.audio_url;
-                    audioEl.style.display = 'block';
-                    audioEl.play();
+                if (data.status === 'ok') {
+                    speakerStatus.textContent = 'Played on speaker.';
+                    speakerStatus.className = 'speaker-status success';
+                } else {
+                    speakerStatus.textContent = data.error || 'Playback failed.';
+                    speakerStatus.className = 'speaker-status error';
                 }
             } catch (e) {
-                console.error(e);
+                speakerStatus.textContent = 'Error: ' + e.message;
+                speakerStatus.className = 'speaker-status error';
             }
             speakBtn.disabled = false;
         });
@@ -497,17 +507,24 @@ def capture_route():
         if not text:
             text = "Could not describe image."
 
-        audio_url = None
+        speaker_status = "not_attempted"
         tts = get_tts()
         if tts.is_available():
-            audio_id = str(uuid.uuid4())
-            audio_dir = os.path.join(app.root_path, "static", "audio")
-            os.makedirs(audio_dir, exist_ok=True)
-            audio_path = os.path.join(audio_dir, f"{audio_id}.wav")
-            if tts.synthesize_to_file(text, audio_path):
-                audio_url = f"/static/audio/{audio_id}.wav"
+            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                if tts.synthesize_to_file(text, wav_path):
+                    ok, err = _play_wav_on_speaker(wav_path)
+                    speaker_status = "ok" if ok else err
+                else:
+                    speaker_status = "synthesis_failed"
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
 
-        return jsonify({"text": text, "audio_url": audio_url})
+        return jsonify({"text": text, "speaker": speaker_status})
     except Exception as e:
         logger.exception("Capture failed")
         return jsonify({"error": str(e)}), 500
@@ -515,7 +532,7 @@ def capture_route():
 
 @app.route("/speak", methods=["POST"])
 def speak_route():
-    """Generate TTS for given text."""
+    """Synthesize TTS for given text and play through the Pi speaker."""
     data = request.get_json()
     text = (data or {}).get("text", "")
     if not text:
@@ -525,17 +542,49 @@ def speak_route():
     if not tts.is_available():
         return jsonify({"error": "TTS not available"}), 503
 
-    audio_id = str(uuid.uuid4())
-    audio_dir = os.path.join(app.root_path, "static", "audio")
-    os.makedirs(audio_dir, exist_ok=True)
-    audio_path = os.path.join(audio_dir, f"{audio_id}.wav")
-    if tts.synthesize_to_file(text, audio_path):
-        return jsonify({"audio_url": f"/static/audio/{audio_id}.wav"})
-    return jsonify({"error": "TTS synthesis failed"}), 500
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        if not tts.synthesize_to_file(text, wav_path):
+            return jsonify({"error": "TTS synthesis failed"}), 500
+
+        ok, err = _play_wav_on_speaker(wav_path)
+        if not ok:
+            return jsonify({"error": err}), 500
+        return jsonify({"status": "ok"})
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
 
 
 # ALSA device for the USB speaker (EMEET OfficeCore M0 Plus, card 2)
 ALSA_DEVICE = os.environ.get("ALSA_DEVICE", "plughw:2,0")
+
+
+def _play_wav_on_speaker(wav_path: str) -> tuple[bool, str]:
+    """Play a WAV file through the Pi's USB speaker via aplay.
+
+    Returns (success, error_message). On success error_message is empty.
+    """
+    try:
+        result = subprocess.run(
+            ["aplay", "-D", ALSA_DEVICE, wav_path],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")[:500]
+            logger.error("aplay failed: %s", stderr)
+            return False, f"Audio playback failed: {stderr}"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        logger.error("aplay timed out")
+        return False, "Audio playback timed out"
+    except Exception as e:
+        logger.exception("aplay error")
+        return False, str(e)
 
 
 @app.route("/tts_play", methods=["POST"])
@@ -556,23 +605,10 @@ def tts_play_route():
         if not tts.synthesize_to_file(text, wav_path):
             return jsonify({"error": "TTS synthesis failed"}), 500
 
-        result = subprocess.run(
-            ["aplay", "-D", ALSA_DEVICE, wav_path],
-            capture_output=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace")[:500]
-            logger.error("aplay failed: %s", stderr)
-            return jsonify({"error": f"Audio playback failed: {stderr}"}), 500
-
+        ok, err = _play_wav_on_speaker(wav_path)
+        if not ok:
+            return jsonify({"error": err}), 500
         return jsonify({"status": "ok"})
-    except subprocess.TimeoutExpired:
-        logger.error("aplay timed out")
-        return jsonify({"error": "Audio playback timed out"}), 500
-    except Exception as e:
-        logger.exception("TTS play failed")
-        return jsonify({"error": str(e)}), 500
     finally:
         try:
             os.unlink(wav_path)
