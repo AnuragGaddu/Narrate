@@ -54,8 +54,8 @@ class TTSEngine:
         if not self._ensure_loaded():
             return False
         try:
-            with wave.open(output_path, "w") as wav_file:
-                self._voice.synthesize(text, wav_file)
+            with wave.open(output_path, "wb") as wav_file:
+                self._voice.synthesize_wav(text, wav_file)
             return True
         except Exception:
             return False
@@ -69,7 +69,7 @@ class TTSEngine:
         try:
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wav_file:
-                self._voice.synthesize(text, wav_file)
+                self._voice.synthesize_wav(text, wav_file)
             buffer.seek(0)
             return buffer.read()
         except Exception:

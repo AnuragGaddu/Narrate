@@ -274,11 +274,23 @@ HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Narration Camera</title>
+    <title>Narrate</title>
     <style>
         * { box-sizing: border-box; }
         body { font-family: system-ui, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
         h1 { margin-bottom: 16px; }
+
+        /* Tab bar */
+        .tab-bar { display: flex; gap: 4px; margin-bottom: 20px; }
+        .tab-btn {
+            padding: 10px 24px; font-size: 15px; border: none; border-radius: 8px 8px 0 0;
+            cursor: pointer; background: #16213e; color: #94a3b8; transition: background 0.2s;
+        }
+        .tab-btn.active { background: #0f0f1a; color: #eee; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        /* Tab 1 - Narration Camera */
         .stream-container { background: #0f0f1a; border-radius: 8px; overflow: hidden; margin-bottom: 16px; max-width: 640px; }
         .stream-container img { width: 100%; display: block; }
         .controls { margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }
@@ -291,23 +303,67 @@ HTML = """
         .loading { color: #94a3b8; }
         .error { color: #f87171; }
         audio { margin-top: 12px; width: 100%; max-width: 400px; }
+
+        /* Tab 2 - Text to Speech */
+        .tts-container { max-width: 640px; }
+        .tts-container textarea {
+            width: 100%; min-height: 160px; padding: 14px; font-size: 16px; font-family: inherit;
+            border: 2px solid #2a2a4a; border-radius: 8px; background: #16213e; color: #eee;
+            resize: vertical; outline: none; transition: border-color 0.2s;
+        }
+        .tts-container textarea:focus { border-color: #60a5fa; }
+        .tts-controls { margin-top: 12px; display: flex; align-items: center; gap: 16px; }
+        .tts-status { font-size: 14px; color: #94a3b8; }
+        .tts-status.error { color: #f87171; }
+        .tts-status.success { color: #4ade80; }
     </style>
 </head>
 <body>
-    <h1>Narration Camera</h1>
-    <div class="stream-container">
-        <img src="/video_feed" alt="Live camera stream" width="640" height="480">
+    <h1>Narrate</h1>
+
+    <div class="tab-bar">
+        <button class="tab-btn active" data-tab="camera">Narration Camera</button>
+        <button class="tab-btn" data-tab="tts">Text to Speech</button>
     </div>
-    <div class="controls">
-        <button id="capture" class="btn-capture">Capture</button>
-        <button id="speak" class="btn-speak" disabled>Speak</button>
+
+    <!-- Tab 1: Narration Camera -->
+    <div id="tab-camera" class="tab-panel active">
+        <div class="stream-container">
+            <img src="/video_feed" alt="Live camera stream" width="640" height="480">
+        </div>
+        <div class="controls">
+            <button id="capture" class="btn-capture">Capture</button>
+            <button id="speak" class="btn-speak" disabled>Speak</button>
+        </div>
+        <div class="narration-box">
+            <p id="narration">Press Capture to describe what the camera sees.</p>
+        </div>
+        <audio id="audio" controls style="display:none"></audio>
     </div>
-    <div class="narration-box">
-        <p id="narration">Press Capture to describe what the camera sees.</p>
+
+    <!-- Tab 2: Text to Speech -->
+    <div id="tab-tts" class="tab-panel">
+        <div class="tts-container">
+            <textarea id="tts-input" placeholder="Type or paste text here..."></textarea>
+            <div class="tts-controls">
+                <button id="tts-speak" class="btn-speak">Speak</button>
+                <span id="tts-status" class="tts-status"></span>
+            </div>
+        </div>
     </div>
-    <audio id="audio" controls style="display:none"></audio>
 
     <script>
+        /* ---- Tab switching ---- */
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+            });
+        });
+
+        /* ---- Tab 1: Narration Camera ---- */
         const captureBtn = document.getElementById('capture');
         const speakBtn = document.getElementById('speak');
         const narrationEl = document.getElementById('narration');
@@ -361,6 +417,42 @@ HTML = """
                 console.error(e);
             }
             speakBtn.disabled = false;
+        });
+
+        /* ---- Tab 2: Text to Speech ---- */
+        const ttsInput = document.getElementById('tts-input');
+        const ttsSpeakBtn = document.getElementById('tts-speak');
+        const ttsStatus = document.getElementById('tts-status');
+
+        ttsSpeakBtn.addEventListener('click', async () => {
+            const text = ttsInput.value.trim();
+            if (!text) {
+                ttsStatus.textContent = 'Please enter some text first.';
+                ttsStatus.className = 'tts-status error';
+                return;
+            }
+            ttsSpeakBtn.disabled = true;
+            ttsStatus.textContent = 'Synthesizing and playing...';
+            ttsStatus.className = 'tts-status';
+            try {
+                const res = await fetch('/tts_play', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    ttsStatus.textContent = 'Done.';
+                    ttsStatus.className = 'tts-status success';
+                } else {
+                    ttsStatus.textContent = data.error || 'Playback failed.';
+                    ttsStatus.className = 'tts-status error';
+                }
+            } catch (e) {
+                ttsStatus.textContent = 'Error: ' + e.message;
+                ttsStatus.className = 'tts-status error';
+            }
+            ttsSpeakBtn.disabled = false;
         });
     </script>
 </body>
@@ -440,6 +532,52 @@ def speak_route():
     if tts.synthesize_to_file(text, audio_path):
         return jsonify({"audio_url": f"/static/audio/{audio_id}.wav"})
     return jsonify({"error": "TTS synthesis failed"}), 500
+
+
+# ALSA device for the USB speaker (EMEET OfficeCore M0 Plus, card 2)
+ALSA_DEVICE = os.environ.get("ALSA_DEVICE", "plughw:2,0")
+
+
+@app.route("/tts_play", methods=["POST"])
+def tts_play_route():
+    """Synthesize text and play it through the USB speaker."""
+    data = request.get_json()
+    text = (data or {}).get("text", "")
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    tts = get_tts()
+    if not tts.is_available():
+        return jsonify({"error": "TTS not available"}), 503
+
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        if not tts.synthesize_to_file(text, wav_path):
+            return jsonify({"error": "TTS synthesis failed"}), 500
+
+        result = subprocess.run(
+            ["aplay", "-D", ALSA_DEVICE, wav_path],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")[:500]
+            logger.error("aplay failed: %s", stderr)
+            return jsonify({"error": f"Audio playback failed: {stderr}"}), 500
+
+        return jsonify({"status": "ok"})
+    except subprocess.TimeoutExpired:
+        logger.error("aplay timed out")
+        return jsonify({"error": "Audio playback timed out"}), 500
+    except Exception as e:
+        logger.exception("TTS play failed")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
 
 
 def main():
