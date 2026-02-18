@@ -1,14 +1,20 @@
-"""Narration Camera - Flask app with live Pi Cam stream, capture, and TTS."""
+"""Narration Camera - Flask app with live Pi Cam stream, capture, and TTS.
+
+Voice trigger: say "capture image" to capture, describe, and narrate.
+"""
 
 import atexit
 import json
 import logging
+import math
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -27,6 +33,9 @@ _last_jpeg_lock = threading.Lock()
 _frozen_jpeg = None
 _frozen_until = 0.0
 _freeze_lock = threading.Lock()
+
+# Prevent concurrent capture-describe-speak pipelines
+_capture_lock = threading.Lock()
 
 # JPEG markers for MJPEG frame splitting
 _JPEG_SOI = b"\xff\xd8"
@@ -267,6 +276,60 @@ def get_vlm():
     return _vlm
 
 
+def _do_capture_and_narrate() -> tuple[str | None, str, str | None]:
+    """Capture frame, describe via VLM, speak via TTS.
+
+    Returns (description_text, speaker_status, error).
+    On success error is None; on failure description_text is None.
+    """
+    global _frozen_jpeg, _frozen_until
+
+    frame = capture_frame()
+    if frame is None:
+        return None, "not_attempted", "Camera not available"
+
+    # Freeze captured frame on the video feed for 3 seconds
+    try:
+        from PIL import Image
+        import io
+        img = Image.fromarray(frame)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        with _freeze_lock:
+            _frozen_jpeg = buf.getvalue()
+            _frozen_until = time.time() + 3.0
+    except Exception as e:
+        logger.debug("Could not freeze frame for display: %s", e)
+
+    try:
+        vlm = get_vlm()
+        text = vlm.describe_image(frame)
+        if not text:
+            text = "Could not describe image."
+
+        speaker_status = "not_attempted"
+        tts = get_tts()
+        if tts.is_available():
+            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                if tts.synthesize_to_file(text, wav_path):
+                    ok, err = _play_wav_on_speaker(wav_path)
+                    speaker_status = "ok" if ok else err
+                else:
+                    speaker_status = "synthesis_failed"
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+        return text, speaker_status, None
+    except Exception as e:
+        logger.exception("Capture pipeline failed")
+        return None, "not_attempted", str(e)
+
+
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -482,52 +545,17 @@ def video_feed_route():
 
 @app.route("/capture", methods=["POST"])
 def capture_route():
-    """Capture frame, run VLM, optionally generate TTS. Freezes stream to this frame for 3s."""
-    global _frozen_jpeg, _frozen_until
-    frame = capture_frame()
-    if frame is None:
-        return jsonify({"error": "Camera not available"}), 500
-
-    # Show captured frame on the stream area for 3 seconds
+    """Capture frame, run VLM, generate TTS. Freezes stream to captured frame for 3s."""
+    acquired = _capture_lock.acquire(blocking=True, timeout=30)
+    if not acquired:
+        return jsonify({"error": "Another capture is in progress"}), 429
     try:
-        from PIL import Image
-        import io
-        img = Image.fromarray(frame)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        with _freeze_lock:
-            _frozen_jpeg = buf.getvalue()
-            _frozen_until = time.time() + 3.0
-    except Exception as e:
-        logger.debug("Could not freeze frame for display: %s", e)
-
-    try:
-        vlm = get_vlm()
-        text = vlm.describe_image(frame)
-        if not text:
-            text = "Could not describe image."
-
-        speaker_status = "not_attempted"
-        tts = get_tts()
-        if tts.is_available():
-            fd, wav_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            try:
-                if tts.synthesize_to_file(text, wav_path):
-                    ok, err = _play_wav_on_speaker(wav_path)
-                    speaker_status = "ok" if ok else err
-                else:
-                    speaker_status = "synthesis_failed"
-            finally:
-                try:
-                    os.unlink(wav_path)
-                except OSError:
-                    pass
-
+        text, speaker_status, error = _do_capture_and_narrate()
+        if error:
+            return jsonify({"error": error}), 500
         return jsonify({"text": text, "speaker": speaker_status})
-    except Exception as e:
-        logger.exception("Capture failed")
-        return jsonify({"error": str(e)}), 500
+    finally:
+        _capture_lock.release()
 
 
 @app.route("/speak", methods=["POST"])
@@ -616,10 +644,167 @@ def tts_play_route():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Voice trigger (Vosk)
+# ---------------------------------------------------------------------------
+
+_VOSK_RATE = 16000
+_VOSK_CHANNELS = 1
+_VOSK_CHUNK = 4000  # ~250ms at 16kHz
+_VOSK_TRIGGER = "capture image"
+_VOSK_COOLDOWN = 3.0
+_VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "vosk-model-small-en-us-0.15")
+
+# Set by _voice_listener_loop; True while the pipeline is running (echo gate)
+_voice_busy = threading.Event()
+
+
+def _find_emeet_device_index(pa) -> int | None:
+    """Scan PyAudio input devices for the EMEET mic."""
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        name = info.get("name", "")
+        if info.get("maxInputChannels", 0) > 0 and ("EMEET" in name or "M0" in name):
+            logger.info("Found EMEET mic: index=%d, name=%r", i, name)
+            return i
+    return None
+
+
+def _generate_beep_wav(path: str, freq: int = 880, duration: float = 0.15):
+    """Write a short sine-wave beep to a WAV file."""
+    n_samples = int(_VOSK_RATE * duration)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(_VOSK_RATE)
+        for i in range(n_samples):
+            sample = int(24000 * math.sin(2 * math.pi * freq * i / _VOSK_RATE))
+            wf.writeframes(struct.pack("<h", sample))
+
+
+def _play_beep():
+    """Generate a beep WAV and play it through the speaker."""
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        _generate_beep_wav(path)
+        subprocess.run(
+            ["aplay", "-D", ALSA_DEVICE, path],
+            capture_output=True,
+            timeout=5,
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _voice_listener_loop():
+    """Background thread: listen for trigger phrase and run capture pipeline."""
+    try:
+        import pyaudio
+        import vosk
+    except ImportError as e:
+        logger.warning("Voice listener unavailable (missing dependency: %s)", e)
+        return
+
+    if not os.path.isdir(_VOSK_MODEL_PATH):
+        logger.warning("Vosk model not found at %s — voice trigger disabled", _VOSK_MODEL_PATH)
+        return
+
+    vosk.SetLogLevel(-1)
+    model = vosk.Model(_VOSK_MODEL_PATH)
+    recognizer = vosk.KaldiRecognizer(model, _VOSK_RATE)
+
+    pa = pyaudio.PyAudio()
+    device_index = _find_emeet_device_index(pa)
+
+    stream_kwargs = {
+        "format": pyaudio.paInt16,
+        "channels": _VOSK_CHANNELS,
+        "rate": _VOSK_RATE,
+        "input": True,
+        "frames_per_buffer": _VOSK_CHUNK,
+    }
+    if device_index is not None:
+        stream_kwargs["input_device_index"] = device_index
+    else:
+        logger.warning("EMEET mic not found, using default input device")
+
+    try:
+        stream = pa.open(**stream_kwargs)
+    except Exception as e:
+        logger.error("Could not open mic stream: %s", e)
+        pa.terminate()
+        return
+
+    logger.info("Voice listener active — say '%s' to trigger capture", _VOSK_TRIGGER)
+
+    last_trigger = 0.0
+    try:
+        while True:
+            data = stream.read(_VOSK_CHUNK, exception_on_overflow=False)
+
+            # While the capture pipeline is running, discard audio (echo suppression)
+            if _voice_busy.is_set():
+                continue
+
+            triggered = False
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                text = result.get("text", "")
+                if _VOSK_TRIGGER in text and (time.time() - last_trigger) > _VOSK_COOLDOWN:
+                    triggered = True
+                    logger.info("Voice trigger (final): %r", text)
+            else:
+                partial = json.loads(recognizer.PartialResult())
+                text = partial.get("partial", "")
+                if _VOSK_TRIGGER in text and (time.time() - last_trigger) > _VOSK_COOLDOWN:
+                    triggered = True
+                    logger.info("Voice trigger (partial): %r", text)
+
+            if triggered:
+                last_trigger = time.time()
+                _voice_busy.set()
+                try:
+                    _play_beep()
+                    if not _capture_lock.acquire(blocking=False):
+                        logger.info("Capture already in progress, skipping voice trigger")
+                        continue
+                    try:
+                        text, speaker_status, error = _do_capture_and_narrate()
+                        if error:
+                            logger.error("Voice-triggered capture failed: %s", error)
+                        else:
+                            logger.info("Voice-triggered narration: %s (speaker: %s)", text, speaker_status)
+                    finally:
+                        _capture_lock.release()
+                finally:
+                    _voice_busy.clear()
+                    # Reset recognizer to flush any buffered audio from the TTS playback
+                    recognizer = vosk.KaldiRecognizer(model, _VOSK_RATE)
+                    last_trigger = time.time()
+    except Exception as e:
+        logger.error("Voice listener crashed: %s", e, exc_info=True)
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+        logger.info("Voice listener stopped")
+
+
+def _start_voice_listener():
+    """Start the voice trigger listener as a background daemon thread."""
+    t = threading.Thread(target=_voice_listener_loop, daemon=True, name="vosk-listener")
+    t.start()
+
+
 def main():
     init_camera()
     if not _camera_ready:
         logger.warning("Camera not available - stream will be blank")
+    _start_voice_listener()
     app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
 
 
