@@ -510,8 +510,8 @@ header h1{font-size:20px;font-weight:600}
 /* Col 3 — Text */
 .vlm-body{padding:14px;line-height:1.65;font-size:14px;min-height:80px;white-space:pre-wrap}
 .vlm-body.ph{color:#475569}
-.log-wrap{flex:1;min-height:0;display:flex;flex-direction:column}
-.log-scroll{flex:1;overflow-y:auto;padding:6px 12px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px;line-height:1.7;max-height:300px}
+.log-wrap{min-height:0;display:flex;flex-direction:column}
+.log-scroll{overflow-y:auto;padding:6px 12px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px;line-height:1.7;max-height:50vh}
 .le{padding:1px 0}
 .le.info{color:#94a3b8}
 .le.warning{color:#fbbf24}
@@ -552,30 +552,30 @@ header h1{font-size:20px;font-weight:600}
     <button class="btn-trig" id="trigBtn">Trigger</button>
   </div>
 
-  <!-- Col 2: Video / Image -->
+  <!-- Col 2: Video / Log -->
   <div class="col">
-    <h2>Video / Image</h2>
+    <h2>Video</h2>
     <div class="card vid-card">
       <div class="card-hdr">Live Stream</div>
       <img src="/video_feed" alt="Live camera stream" id="vidStream">
     </div>
+    <div class="card log-wrap">
+      <div class="card-hdr">Log</div>
+      <div class="log-scroll" id="log"></div>
+    </div>
+  </div>
+
+  <!-- Col 3: Image / Caption -->
+  <div class="col">
+    <h2>Image / Caption</h2>
     <div class="card cap-card" id="capCard">
       <div class="card-hdr">Captured Image</div>
       <div class="cap-empty" id="capEmpty">No capture yet</div>
       <img id="capImg" src="" alt="" style="display:none">
     </div>
-  </div>
-
-  <!-- Col 3: Text Caption -->
-  <div class="col">
-    <h2>Text Caption</h2>
-    <div class="card" style="flex:1">
+    <div class="card">
       <div class="card-hdr">VLM Output</div>
       <div class="vlm-body ph" id="vlm">Waiting for capture...</div>
-    </div>
-    <div class="card log-wrap">
-      <div class="card-hdr">Log</div>
-      <div class="log-scroll" id="log"></div>
     </div>
   </div>
 
