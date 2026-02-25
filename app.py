@@ -8,6 +8,7 @@ import atexit
 import json
 import logging
 import math
+import multiprocessing
 import os
 import queue
 import shutil
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import wave
+from concurrent.futures import ProcessPoolExecutor
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -217,7 +219,7 @@ def capture_frame():
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
             arr = np.array(img)
             _dbg("capture_frame success from stream", {"shape": list(arr.shape)}, "A")
-            return arr
+            return arr, jpeg
         except Exception as e:
             _dbg("stream frame decode failed", {"error": str(e)}, "A")
             logger.warning("Stream frame decode failed: %s", e)
@@ -243,10 +245,12 @@ def capture_frame():
             _dbg("rpicam-still failed", {"returncode": result.returncode, "stderr": stderr_s}, "H1")
             logger.error("rpicam-still failed: %s", result.stderr.decode(errors="replace"))
             return None
-        img = Image.open(path).convert("RGB")
+        with open(path, "rb") as f:
+            jpeg_fallback = f.read()
+        img = Image.open(io.BytesIO(jpeg_fallback)).convert("RGB")
         arr = np.array(img)
         _dbg("capture_frame success from rpicam-still", {"shape": list(arr.shape)}, "A")
-        return arr
+        return arr, jpeg_fallback
     except subprocess.TimeoutExpired:
         _dbg("rpicam-still timed out", {}, "B")
         logger.error("rpicam-still timed out")
@@ -290,6 +294,17 @@ def get_vlm():
         from vlm import get_vlm_engine
         _vlm = get_vlm_engine()
     return _vlm
+
+
+_vlm_mp_ctx = multiprocessing.get_context("spawn")
+_vlm_executor = ProcessPoolExecutor(max_workers=1, mp_context=_vlm_mp_ctx)
+
+
+def _vlm_infer(frame_array):
+    """Run VLM inference in a worker process (avoids GIL blocking main process)."""
+    from vlm import get_vlm_engine
+    vlm = get_vlm_engine()
+    return vlm.describe_image(frame_array)
 
 
 # ---------------------------------------------------------------------------
@@ -377,20 +392,15 @@ def _run_pipeline(source: str = "manual"):
         broadcast_event("status", {"phase": "capturing"})
         logger.info("Pipeline started (source: %s)", source)
 
-        frame = capture_frame()
-        if frame is None:
+        result = capture_frame()
+        if result is None:
             broadcast_event("error", {"message": "Camera not available"})
             broadcast_event("status", {"phase": "idle"})
             return
+        frame, jpeg_bytes = result
 
-        # Store captured JPEG for the UI
+        # Store captured JPEG for the UI (using original JPEG, no re-encode needed)
         try:
-            from PIL import Image
-            import io
-            img = Image.fromarray(frame)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            jpeg_bytes = buf.getvalue()
             with _captured_jpeg_lock:
                 _captured_jpeg = jpeg_bytes
             with _freeze_lock:
@@ -402,11 +412,11 @@ def _run_pipeline(source: str = "manual"):
         except Exception as e:
             logger.debug("Could not freeze/store frame: %s", e)
 
-        # -- Stage 2: VLM inference --
+        # -- Stage 2: VLM inference (runs in separate process to avoid GIL block) --
         broadcast_event("status", {"phase": "processing_vlm"})
         try:
-            vlm = get_vlm()
-            text = vlm.describe_image(frame)
+            future = _vlm_executor.submit(_vlm_infer, frame)
+            text = future.result(timeout=60)
             if not text:
                 text = "Could not describe image."
         except Exception as e:
@@ -777,6 +787,7 @@ def stop_tts_route():
     if proc is not None:
         try:
             proc.terminate()
+            broadcast_event("status", {"phase": "idle"})
             logger.info("TTS playback stopped by user")
         except Exception:
             pass
@@ -924,9 +935,9 @@ def _voice_listener_loop():
             if triggered:
                 last_trigger = time.time()
                 _voice_busy.set()
-                _play_beep()
                 broadcast_event("trigger", {"active": True})
                 broadcast_event("status", {"phase": "triggered"})
+                threading.Thread(target=_play_beep, daemon=True).start()
                 threading.Thread(
                     target=_run_pipeline, args=("voice",), daemon=True,
                 ).start()
